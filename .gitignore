@@ -1,0 +1,19 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.idea/
+
+# data — DB는 재생성 가능, 영상 제목(title)이 무스포 원칙 위반이라 항상 제외
+data/vods/*.sqlite
+data/vods/*.sqlite-journal
+data/vods/*.sqlite-wal
+data/vods/*.sqlite-shm
+
+# IDE 부산물 (PyCharm DataGrip 등이 만드는 빈 SQLite)
+data/identifier.sqlite
