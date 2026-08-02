@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -41,7 +42,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-DB_PATH = ROOT / "data" / "vods" / "videos.sqlite"
+DB_PATH = Path(os.environ["LCK_DB_PATH"]) if os.environ.get("LCK_DB_PATH") else ROOT / "data" / "vods" / "videos.sqlite"
+
+
+def _rel(p: Path) -> str:
+    """ROOT 기준 상대경로. 볼륨 등 ROOT 밖이면 절대경로 그대로."""
+    try:
+        return str(Path(p).relative_to(ROOT))
+    except ValueError:
+        return str(p)
 
 SOURCE = "chzzk"
 API_BASE = "https://api.chzzk.naver.com/service/v1/channels"
@@ -310,7 +319,7 @@ def main() -> int:
         "--db",
         type=Path,
         default=DB_PATH,
-        help=f"SQLite DB 경로 (기본: {DB_PATH.relative_to(ROOT)})",
+        help=f"SQLite DB 경로 (기본: {_rel(DB_PATH)})",
     )
     args = parser.parse_args()
 
@@ -336,7 +345,7 @@ def main() -> int:
     record_run_finish(conn, run_id, pages, new_count, updated_count, "ok", None)
     print(
         f"완료: {pages}페이지 / 신규 {new_count}건 / 업데이트 {updated_count}건 "
-        f"→ {args.db.relative_to(ROOT)}"
+        f"→ {_rel(args.db)}"
     )
     return 0
 

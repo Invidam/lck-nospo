@@ -2,6 +2,10 @@
 
 `lck-nospo` 저장소에서 코딩 에이전트가 작업할 때 따라야 할 가이드.
 
+> **공통 컨벤션(정본)**: @~/PycharmProjects/vimos/shared/CONVENTIONS.md
+> — 여러 프로젝트 공통의 구조·아키텍처·배포·로깅·문서화·비밀 규칙. 항상 우선 참조하고,
+> 아래는 lck-nospo 고유 내용이다.
+
 ## 프로젝트 한 줄 요약
 
 LCK/VCT VOD를 **스포일러 없이** 다시볼 수 있게 해주는 플랫폼. 결과를 유추할 수 있는 모든 요소(썸네일, 길이, 점수, MVP, 댓글, 추천)를 제거한다.
@@ -264,6 +268,27 @@ cp .env.example .env   # TELEGRAM_BOT_TOKEN 채우기
 - [ ] 새 파일명을 정자(`rounds-…`)로 저장했는가?
 - [ ] 스크립트를 적절한 도메인의 `<domain>/scripts/` 아래에 두었는가?
 - [ ] VOD 어댑터를 추가했다면 `videos` 공용 스키마를 확장하지 않고 매핑했는가?
+
+## 배포
+
+공통 배포 규칙(단일 이미지 + `MODE` 분기, Docker-in-LXC, 필수 run 옵션 등)은 정본
+`~/PycharmProjects/vimos/shared/CONVENTIONS.md` §2·§4 참조. 아래는 lck 고유 사항:
+
+- **상시 = `MODE=bot`**(텔레그램 봇 polling), **배치 = `MODE=fetch`**(VOD 증분 수집 후 종료).
+  `deploy/entrypoint.sh` 가 분기하고, 봇 최초 기동 시 DB 가 비어 있으면 일정 import +
+  초기 수집으로 부트스트랩한다.
+- **DB 경로는 `LCK_DB_PATH` env 로 override**. 봇·fetch·classify·winners·import 5개
+  스크립트가 이 변수를 존중하고, 미설정 시 로컬 `data/vods/videos.sqlite` 로 폴백.
+- **배포**: `./deploy/deploy.sh` (CTID 기본 202=`ct-bots`). `--fetch` 로 수집 1회,
+  `--no-build` 로 재기동만. 운영 좌표·현황은 `deploy/STATUS.md`.
+- **VOD 수집 자동화는 서버 cron**(`deploy/crontab`, 경기 시간대 7분 주기). 봇은 무상태라
+  수집 후 재시작 불필요.
+
+## Changelog
+
+- **2026-08-02** — Docker 배포 도입. `deploy/` 세트(Dockerfile·entrypoint·deploy.sh·
+  crontab·README·STATUS) 추가, 5개 스크립트에 `LCK_DB_PATH` env override.
+  LXC 202(`ct-bots`)에 최초 배포 완료 — 봇 상시 + cron 수집.
 
 ## 알려진 이슈
 

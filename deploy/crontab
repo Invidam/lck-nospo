@@ -1,0 +1,29 @@
+# ============================================================================
+# lck-nospo VOD 수집 배치 (LXC 안 호스트 cron)
+# ----------------------------------------------------------------------------
+# MODE=fetch 컨테이너를 주기적으로 띄워 치지직 신규 VOD 를 수집한다.
+#   fetch → classify(신규) → winners(신규) 후 --rm 으로 스스로 종료.
+# 봇은 무상태(SELECT만)라 데이터 갱신 후 재시작 불필요.
+#
+# 스케줄 근거(README): LCK 경기는 수~일 17~24시 KST 집중, 월/화 휴방.
+#   경기 시간대엔 빠르게(7분), 그 외엔 느슨하게 돈다.
+# 증분 수집이라 신규 0건이면 page 1만 보고 종료 → 부하 거의 없음.
+#
+# 설치 (LXC 안에서):
+#   crontab deploy/crontab      # 등록
+#   crontab -l                  # 확인
+# yfinance/치지직 조회를 위해 컨테이너에 인터넷 접속 필요.
+# ============================================================================
+
+# 공통 run 명령을 매번 쓰기 번거로우면 아래 셸 변수처럼 관리해도 되나,
+# cron 은 라인 단위라 각 줄에 docker run 을 그대로 둔다.
+# DATA_MOUNT=/opt/lck-nospo → 컨테이너 /data (봇과 같은 볼륨 공유)
+
+# 경기 시간대: 수~일(3-7) 17~23시, 7분마다
+*/7 17-23 * * 3-7  docker run --rm --network host --security-opt apparmor=unconfined -e MODE=fetch -e LCK_DB_PATH=/data/videos.sqlite -v /opt/lck-nospo:/data lck-nospo >> /var/log/lck-nospo-fetch.log 2>&1
+
+# 안전망: 매일 00~16시 정각 (늦은 업로드 커버)
+0 0-16 * * *       docker run --rm --network host --security-opt apparmor=unconfined -e MODE=fetch -e LCK_DB_PATH=/data/videos.sqlite -v /opt/lck-nospo:/data lck-nospo >> /var/log/lck-nospo-fetch.log 2>&1
+
+# 안전망: 월/화(1,2) 매시간 (휴방일 늦은 업로드 커버)
+0 * * * 1,2        docker run --rm --network host --security-opt apparmor=unconfined -e MODE=fetch -e LCK_DB_PATH=/data/videos.sqlite -v /opt/lck-nospo:/data lck-nospo >> /var/log/lck-nospo-fetch.log 2>&1

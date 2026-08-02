@@ -1,0 +1,28 @@
+# 빌드 컨텍스트에서 제외 (이미지에 넣지 않는다)
+
+# secrets — 토큰은 런타임에 --env-file 로 주입한다. 이미지에 굽지 않는다.
+.env
+.env.*
+!.env.example
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# DB — 볼륨에서 재생성/공유. 영상 title 무스포 위반이라 이미지에 절대 넣지 않는다.
+data/vods/*.sqlite
+data/vods/*.sqlite-journal
+data/vods/*.sqlite-wal
+data/vods/*.sqlite-shm
+data/identifier.sqlite
+
+# IDE / VCS
+.idea/
+.git/
+.gitignore
+
+# 문서 (런타임 불필요)
+docs/
+AGENTS.md

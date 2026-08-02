@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import hashlib
 import re
 import sqlite3
@@ -33,7 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-DB_PATH = ROOT / "data" / "vods" / "videos.sqlite"
+DB_PATH = Path(os.environ["LCK_DB_PATH"]) if os.environ.get("LCK_DB_PATH") else ROOT / "data" / "vods" / "videos.sqlite"
 
 SUBJECT_RE = re.compile(
     r"^(?P<league>.+?)\s+(?P<year>\d{4})\s+(?P<stage>.+?)\s+-\s+"
@@ -176,7 +177,7 @@ def main() -> int:
     parser.add_argument("sources", nargs="+", type=Path,
                         help="입력 파일들 (CSV 포맷, .ics 확장자도 OK)")
     parser.add_argument("--db", type=Path, default=DB_PATH,
-                        help=f"SQLite 경로 (기본: {DB_PATH.relative_to(ROOT)})")
+                        help="SQLite 경로 (기본: data/vods/videos.sqlite)")
     parser.add_argument("--reset", action="store_true",
                         help="적재 전에 matches 테이블 전체 삭제")
     args = parser.parse_args()

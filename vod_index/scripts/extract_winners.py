@@ -19,6 +19,7 @@ publish_date는 KST 자정 기준 날짜로 변환해 저장. 실제 경기일�
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sqlite3
 import sys
@@ -26,7 +27,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-DB_PATH = ROOT / "data" / "vods" / "videos.sqlite"
+DB_PATH = Path(os.environ["LCK_DB_PATH"]) if os.environ.get("LCK_DB_PATH") else ROOT / "data" / "vods" / "videos.sqlite"
 KST = timezone(timedelta(hours=9))
 
 SCHEMA = """
@@ -180,7 +181,7 @@ def record_run_finish(
 def main() -> int:
     parser = argparse.ArgumentParser(description="인터뷰 영상 → 승팀 추출 적재")
     parser.add_argument("--db", type=Path, default=DB_PATH,
-                        help=f"SQLite 경로 (기본: {DB_PATH.relative_to(ROOT)})")
+                        help="SQLite 경로 (기본: data/vods/videos.sqlite)")
     parser.add_argument("--only-new", action="store_true",
                         help="아직 처리 안 된 인터뷰 영상만")
     args = parser.parse_args()

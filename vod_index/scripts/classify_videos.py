@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sqlite3
 import sys
@@ -29,7 +30,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-DB_PATH = ROOT / "data" / "vods" / "videos.sqlite"
+DB_PATH = Path(os.environ["LCK_DB_PATH"]) if os.environ.get("LCK_DB_PATH") else ROOT / "data" / "vods" / "videos.sqlite"
 KST = timezone(timedelta(hours=9))
 
 SCHEMA = """
@@ -213,7 +214,7 @@ def record_run_finish(
 def main() -> int:
     parser = argparse.ArgumentParser(description="영상 제목 파싱 → 분류 적재")
     parser.add_argument("--db", type=Path, default=DB_PATH,
-                        help=f"SQLite 경로 (기본: {DB_PATH.relative_to(ROOT)})")
+                        help="SQLite 경로 (기본: data/vods/videos.sqlite)")
     parser.add_argument("--only-new", action="store_true",
                         help="미분류 영상만 처리")
     args = parser.parse_args()

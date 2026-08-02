@@ -43,7 +43,8 @@ from telegram.ext import (
 )
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-DB_PATH = ROOT / "data" / "vods" / "videos.sqlite"
+# 배포(Docker)에서는 DB를 볼륨에 두므로 LCK_DB_PATH로 경로를 덮어쓴다.
+DB_PATH = Path(os.environ["LCK_DB_PATH"]) if os.environ.get("LCK_DB_PATH") else ROOT / "data" / "vods" / "videos.sqlite"
 TOTAL_SETS = 5
 KST = timezone(timedelta(hours=9))
 
