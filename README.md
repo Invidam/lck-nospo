@@ -103,9 +103,36 @@ lck-nospo/
 
 Leaguepedia의 MatchCalendarExport를 사용한다.
 
-- URL 예시: `https://lol.fandom.com/wiki/Special:RunQuery/MatchCalendarExport`
-- 폼에서 토너먼트(예: `LCK 2026 Rounds 1-2`)를 선택하면 CSV/ICS export 가능
-- 받은 파일은 `data/schedules/` 하위에 저장
+- 검색 URL: <https://lol.fandom.com/wiki/Special:RunQuery/MatchCalendarExport?pfRunQueryFormName=MatchCalendarExport&MCE%5B1%5D=LCK+2026&wpRunQuery=&pf_free_text=>
+  - `MCE[1]=LCK 2026` 처럼 시즌을 넣고 실행하면 그 시즌 경기가 `Subject,Start Date,Start Time` CSV로 나온다.
+- 폼에서 토너먼트(예: `LCK 2026 Rounds 3-4`)를 선택하면 CSV/ICS export 가능
+- 받은 파일은 `data/schedules/<라운드>.ics` 로 저장 (확장자는 `.ics`지만 내용은 CSV)
+
+> ⚠️ **일정은 자동 갱신되지 않는다.** VOD 수집(`fetch`)은 cron이 돌지만, `matches`(경기 일정)는
+> Leaguepedia에서 **사람이 새 라운드 .ics를 export해서 넣어줘야** 한다. 새 라운드가 시작되면
+> 위 URL에서 export → `data/schedules/`에 저장 → 아래 "일정 갱신" 절차로 반영한다.
+> 안 하면 봇의 `/watch`·`/schedule`이 옛 라운드에서 멈춘 것처럼 보인다.
+
+### 일정 갱신 (새 라운드 반영)
+
+새 .ics를 받은 뒤, **재배포 없이** 운영 중인 봇 DB에 바로 반영할 수 있다 (봇은 무상태):
+
+```bash
+# 로컬에서 파싱 검증 (임시 DB, 실 DB 안 건드림)
+LCK_DB_PATH=/tmp/t.sqlite .venv/bin/python schedule/scripts/import_schedule.py data/schedules/rounds-3-4.ics
+
+# 서버 볼륨으로 복사 후 컨테이너 안에서 import
+scp data/schedules/rounds-3-4.ics root@192.168.0.29:/tmp/r.ics
+ssh root@192.168.0.29 "pct push 202 /tmp/r.ics /opt/lck-nospo/rounds-3-4.ics"
+ssh root@192.168.0.29 "pct exec 202 -- docker exec lck-nospo-bot python schedule/scripts/import_schedule.py /data/rounds-3-4.ics"
+```
+
+`import_schedule.py`는 upsert(멱등)라 같은 파일을 다시 넣어도 중복되지 않는다. 다음 재배포 때는
+이미지에 동봉된 `data/schedules/*.ics` 전체를 부트스트랩에서 다시 import하므로, **커밋에 새 .ics를
+포함시켜 두면** 이후 환경에서도 자동 반영된다.
+
+> 리그 prefix(`LCK 2026 ...` → `LCK`)는 `schedule/scripts/import_schedule.py`의 `LEAGUE_PREFIXES`가
+> 매핑한다. 매핑에 없는 새 대회는 조용히 스킵되므로, 새 리그가 들어오면 거기에 한 줄 추가한다.
 
 ## 사용법
 
