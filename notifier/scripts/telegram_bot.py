@@ -82,6 +82,14 @@ def init_schema(conn: sqlite3.Connection) -> None:
             ON match_winners(match_date, team_a, team_b, winner);
         """
     )
+    # 마이그레이션: 기존 DB에 pre_notify(경기 시작 알림) 컬럼이 없으면 추가.
+    # wins_only(=VOD 종료 후 알림 축)와 독립된 축이다.
+    try:
+        conn.execute(
+            "ALTER TABLE subscriptions ADD COLUMN pre_notify INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError:
+        pass  # 이미 존재
     conn.commit()
 
 logging.basicConfig(
@@ -195,45 +203,92 @@ def team_exists(conn: sqlite3.Connection, team: str) -> bool:
     return row is not None
 
 
-def list_subscriptions(conn: sqlite3.Connection, chat_id: int) -> list[tuple[str, int]]:
+# VOD(종료 후) 알림 축: wins_only 컬럼 두 값으로 표현하되, 구독 자체가 없으면 "off".
+#   off  = VOD 알림 안 받음 (해당 팀 구독 row에서 vod 축이 꺼진 상태)
+#   all  = 모든 경기 VOD 알림 (wins_only=0)
+#   wins = 이긴 경기만       (wins_only=1)
+VOD_OFF, VOD_ALL, VOD_WINS = "off", "all", "wins"
+VOD_CYCLE = {VOD_OFF: VOD_ALL, VOD_ALL: VOD_WINS, VOD_WINS: VOD_OFF}
+
+
+def get_subscription(
+    conn: sqlite3.Connection, chat_id: int, team: str
+) -> tuple[str, bool]:
+    """(vod, pre) 반환. 구독이 없으면 (VOD_OFF, False)."""
+    row = conn.execute(
+        "SELECT wins_only, pre_notify FROM subscriptions WHERE chat_id = ? AND team = ?",
+        (chat_id, team),
+    ).fetchone()
+    if row is None:
+        return VOD_OFF, False
+    vod = VOD_WINS if row[0] else VOD_ALL
+    return vod, bool(row[1])
+
+
+def list_subscriptions(conn: sqlite3.Connection, chat_id: int) -> list[tuple[str, int, int]]:
     rows = conn.execute(
-        "SELECT team, wins_only FROM subscriptions WHERE chat_id = ? ORDER BY team",
+        "SELECT team, wins_only, pre_notify FROM subscriptions "
+        "WHERE chat_id = ? ORDER BY team",
         (chat_id,),
     ).fetchall()
-    return [(r[0], r[1]) for r in rows]
+    return [(r[0], r[1], r[2]) for r in rows]
+
+
+def set_subscription(
+    conn: sqlite3.Connection, chat_id: int, team: str, vod: str, pre: bool
+) -> str:
+    """구독 상태를 (vod, pre) 두 축으로 명시적으로 설정.
+
+    두 축 다 꺼짐(vod=off & pre=False)이면 구독 row를 삭제한다.
+    반환: 'inserted' | 'updated' | 'removed' | 'unchanged'.
+    """
+    now = datetime.now(KST).isoformat(timespec="seconds")
+    existing = conn.execute(
+        "SELECT wins_only, pre_notify FROM subscriptions WHERE chat_id = ? AND team = ?",
+        (chat_id, team),
+    ).fetchone()
+
+    if vod == VOD_OFF and not pre:
+        if existing is None:
+            return "unchanged"
+        conn.execute(
+            "DELETE FROM subscriptions WHERE chat_id = ? AND team = ?",
+            (chat_id, team),
+        )
+        conn.commit()
+        return "removed"
+
+    wo = 1 if vod == VOD_WINS else 0
+    pn = 1 if pre else 0
+    if existing is None:
+        conn.execute(
+            "INSERT INTO subscriptions (chat_id, team, wins_only, pre_notify, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (chat_id, team, wo, pn, now),
+        )
+        conn.commit()
+        return "inserted"
+    if (existing[0], existing[1]) != (wo, pn):
+        conn.execute(
+            "UPDATE subscriptions SET wins_only = ?, pre_notify = ? "
+            "WHERE chat_id = ? AND team = ?",
+            (wo, pn, chat_id, team),
+        )
+        conn.commit()
+        return "updated"
+    return "unchanged"
 
 
 def add_subscription(
     conn: sqlite3.Connection, chat_id: int, team: str, wins_only: bool = False
 ) -> str:
-    """반환: 'inserted' | 'updated' | 'unchanged'.
+    """레거시 커맨드(/subscribe TEAM [wins]) 호환용.
 
-    같은 팀이 이미 구독 중인데 wins_only 옵션이 다르면 UPDATE (덮어쓰기).
+    VOD 축만 설정하고 기존 pre_notify 상태는 보존한다.
     """
-    now = datetime.now(KST).isoformat(timespec="seconds")
-    wo = 1 if wins_only else 0
-    existing = conn.execute(
-        "SELECT wins_only FROM subscriptions WHERE chat_id = ? AND team = ?",
-        (chat_id, team),
-    ).fetchone()
-    if existing is None:
-        conn.execute(
-            """
-            INSERT INTO subscriptions (chat_id, team, wins_only, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (chat_id, team, wo, now),
-        )
-        conn.commit()
-        return "inserted"
-    if existing[0] != wo:
-        conn.execute(
-            "UPDATE subscriptions SET wins_only = ? WHERE chat_id = ? AND team = ?",
-            (wo, chat_id, team),
-        )
-        conn.commit()
-        return "updated"
-    return "unchanged"
+    _, pre = get_subscription(conn, chat_id, team)
+    vod = VOD_WINS if wins_only else VOD_ALL
+    return set_subscription(conn, chat_id, team, vod, pre)
 
 
 def remove_subscription(conn: sqlite3.Connection, chat_id: int, team: str) -> bool:
@@ -376,9 +431,10 @@ HELP_TEXT = (
     "<b>/schedule &lt;팀&gt;</b> — 그 팀 다가오는 10경기\n"
     "  예: <code>/schedule HLE</code>\n\n"
     "<b>/subscribe</b> — 팀 선택 (알림 등록)\n"
-    "<b>/subscribe &lt;팀&gt;</b> — 승패 모두 알림 (예: <code>/subscribe HLE</code>)\n"
-    "<b>/subscribe &lt;팀&gt; wins</b> — 이겼을 때만 알림\n"
-    "  ⚠ 알림이 오는 것 자체가 승리를 알려줍니다.\n\n"
+    "<b>/subscribe &lt;팀&gt;</b> — 버튼으로 알림 설정 (예: <code>/subscribe HLE</code>)\n"
+    "  ⏰ <b>경기 시작 알림</b> — 시작 10분 전 본방 알림\n"
+    "  📺 <b>종료 후 VOD 알림</b> — 전체 / 이긴 것만 / 끔\n"
+    "  ⚠ '이긴 것만'은 알림이 오는 것 자체가 승리를 뜻합니다.\n\n"
     "<b>/unsubscribe</b> — 구독 중인 팀에서 해제\n"
     "<b>/subscriptions</b> — 내 구독 목록\n\n"
     "<b>/help</b> — 이 안내\n\n"
@@ -397,6 +453,50 @@ PERSISTENT_KEYBOARD = ReplyKeyboardMarkup(
     is_persistent=True,
     input_field_placeholder="명령어를 누르거나 직접 입력",
 )
+
+
+_VOD_LABEL = {VOD_OFF: "안 받음", VOD_ALL: "전체", VOD_WINS: "이긴 것만"}
+
+
+def sub_panel_text(team: str, vod: str, pre: bool) -> str:
+    """토글 패널 상단 안내 텍스트 (현재 상태 요약)."""
+    pre_s = "켜짐" if pre else "꺼짐"
+    lines = [
+        f"<b>{team}</b> 알림 설정",
+        f"⏰ 경기 시작 알림: <b>{pre_s}</b> (시작 {PRE_NOTIFY_MINUTES}분 전)",
+        f"📺 종료 후 VOD 알림: <b>{_VOD_LABEL[vod]}</b>",
+    ]
+    if vod == VOD_WINS:
+        lines.append("  ⚠ 이긴 경기만 — 알림이 오는 것 자체가 승리를 뜻합니다.")
+    if vod == VOD_OFF and not pre:
+        lines.append("  (둘 다 꺼두면 구독이 해제됩니다.)")
+    return "\n".join(lines)
+
+
+def build_sub_panel_keyboard(team: str, vod: str, pre: bool) -> InlineKeyboardMarkup:
+    """(시작 알림 토글, VOD 순환) 두 버튼의 인라인 패널."""
+    pre_btn = f"⏰ 시작 알림: {'켜짐 ✅' if pre else '꺼짐'}"
+    vod_btn = f"📺 VOD: {_VOD_LABEL[vod]}"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(pre_btn, callback_data=f"sub:{team}:pre")],
+        [InlineKeyboardButton(vod_btn, callback_data=f"sub:{team}:vod")],
+    ])
+
+
+async def _render_sub_panel(msg_or_query, conn, chat_id, team, *, edit):
+    vod, pre = get_subscription(conn, chat_id, team)
+    text = sub_panel_text(team, vod, pre)
+    kb = build_sub_panel_keyboard(team, vod, pre)
+    if edit:
+        await msg_or_query.edit_message_text(
+            text, parse_mode=ParseMode.HTML,
+            reply_markup=kb, disable_web_page_preview=True,
+        )
+    else:
+        await msg_or_query.reply_text(
+            text, parse_mode=ParseMode.HTML,
+            reply_markup=kb, disable_web_page_preview=True,
+        )
 
 
 def build_team_picker_keyboard(conn: sqlite3.Connection, command: str) -> ReplyKeyboardMarkup:
@@ -420,7 +520,7 @@ def build_unsubscribe_picker_keyboard(
     subs = list_subscriptions(conn, chat_id)
     if not subs:
         return None
-    return _teams_to_picker([team for team, _ in subs], "/unsubscribe")
+    return _teams_to_picker([team for team, *_ in subs], "/unsubscribe")
 
 
 def _teams_to_picker(teams: list[str], command: str) -> ReplyKeyboardMarkup:
@@ -591,25 +691,13 @@ async def cmd_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if len(args) > 2:
         await msg.reply_text(
             "사용법:\n"
-            "  /subscribe <팀>           예: /subscribe HLE  (승패 모두 알림)\n"
-            "  /subscribe <팀> wins      예: /subscribe HLE wins  (이겼을 때만)",
+            "  /subscribe <팀>           예: /subscribe HLE  (버튼으로 알림 설정)\n"
+            "  /subscribe <팀> wins      예: /subscribe HLE wins  (이긴 VOD만 바로 켜기)",
             disable_web_page_preview=True,
         )
         return
 
     team = args[0].upper()
-    wins_only = False
-    if len(args) == 2:
-        if args[1].lower() != "wins":
-            await msg.reply_text(
-                "두 번째 인자는 'wins'만 가능합니다.\n"
-                "  /subscribe <팀>           예: /subscribe HLE\n"
-                "  /subscribe <팀> wins      예: /subscribe HLE wins",
-                disable_web_page_preview=True,
-            )
-            return
-        wins_only = True
-
     if not team_exists(conn, team):
         await msg.reply_text(
             f"{team} 팀이 일정에 없습니다. 팀 약어를 확인해 주세요.",
@@ -617,32 +705,21 @@ async def cmd_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    status = add_subscription(conn, chat.id, team, wins_only=wins_only)
-    if wins_only:
-        body = (
-            f"<b>{team}</b> 구독 완료 (이겼을 때만).\n\n"
-            "⚠ 이 옵션은 <b>알림이 오는 것 자체가 승리를 알려줍니다.</b> "
-            "졌을 땐 알림이 영영 오지 않습니다 (인터뷰 영상 미공개 시도 마찬가지).\n"
-            "승패 모두 받고 싶으면 <code>/subscribe " + team + "</code> 로 덮어쓰세요."
-        )
-    else:
-        body = f"<b>{team}</b> 구독 완료. 경기 종료 추정 시점에 알림을 보냅니다."
+    # 레거시 호환: /subscribe TEAM wins → VOD 축을 즉시 wins로 설정.
+    if len(args) == 2:
+        if args[1].lower() != "wins":
+            await msg.reply_text(
+                "두 번째 인자는 'wins'만 가능합니다. 그냥 <code>/subscribe " + team +
+                "</code> 로 버튼 설정을 쓰는 걸 권장합니다.",
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            return
+        _, pre = get_subscription(conn, chat.id, team)
+        set_subscription(conn, chat.id, team, VOD_WINS, pre)
 
-    if status == "inserted":
-        await msg.reply_text(body, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    elif status == "updated":
-        await msg.reply_text(
-            f"<b>{team}</b> 옵션 변경됨.\n\n" + body,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-    else:
-        suffix = " (이겼을 때만)" if wins_only else ""
-        await msg.reply_text(
-            f"<b>{team}</b>{suffix} 이미 구독 중입니다.",
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+    # 팀이 정해지면 항상 토글 패널을 띄운다 (버튼으로 두 축을 켜고 끔).
+    await _render_sub_panel(msg, conn, chat.id, team, edit=False)
 
 
 async def cmd_unsubscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -703,9 +780,12 @@ async def cmd_subscriptions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
     lines = []
-    for team, wo in subs:
-        suffix = " <i>(이겼을 때만)</i>" if wo else ""
-        lines.append(f"• <b>{team}</b>{suffix}")
+    for team, wo, pn in subs:
+        opts = []
+        if pn:
+            opts.append("⏰ 시작 알림")
+        opts.append("📺 VOD(이긴 것만)" if wo else "📺 VOD(전체)")
+        lines.append(f"• <b>{team}</b> — " + ", ".join(opts))
     body = "\n".join(lines)
     await msg.reply_text(
         f"구독 중인 팀 ({len(subs)}개)\n{body}",
@@ -713,6 +793,10 @@ async def cmd_subscriptions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         disable_web_page_preview=True,
     )
 
+
+# 경기 시작 알림: 시작 N분 전에 예약 발송. 앞으로 며칠치를 스캔해 예약할지.
+PRE_NOTIFY_MINUTES = 10
+PRE_NOTIFY_SCAN_DAYS = 3
 
 NOTIFY_DELAY_HOURS = 4
 NOTIFY_INTERVAL_SEC = 300
@@ -798,6 +882,134 @@ def mark_notified(conn: sqlite3.Connection, chat_id: int, match_id: str) -> None
     conn.commit()
 
 
+def is_notified(conn: sqlite3.Connection, chat_id: int, match_id: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM notifications WHERE chat_id = ? AND match_id = ?",
+        (chat_id, match_id),
+    ).fetchone() is not None
+
+
+# ----- 경기 시작 알림 (start_at_kst - PRE_NOTIFY_MINUTES 에 run_once 예약) -----
+
+def _pre_key(match_id: str) -> str:
+    """시작 알림용 notifications 키. VOD 알림(match_id)과 분리."""
+    return f"{match_id}:pre"
+
+
+def _parse_start(start_at_kst: str) -> datetime:
+    """'YYYY-MM-DDTHH:MM:SS+09:00' → tz-aware datetime(KST)."""
+    return datetime.fromisoformat(start_at_kst)
+
+
+def find_pre_notify_matches(conn: sqlite3.Connection, days: int) -> list[dict]:
+    """지금 ~ +days 사이 시작하는 매치 중, pre_notify=1 구독자가 하나라도 있는 것.
+
+    매치 단위(중복 제거)로 반환. 발송 대상 chat_id 확정은 발동 시점에 다시 조회한다.
+    """
+    now = datetime.now(KST)
+    horizon = (now + timedelta(days=days)).isoformat(timespec="seconds")
+    rows = conn.execute(
+        """
+        SELECT DISTINCT m.match_id, m.league, m.team_a, m.team_b,
+               m.start_at_kst, m.stage
+          FROM matches m
+          JOIN subscriptions s
+            ON (m.team_a = s.team OR m.team_b = s.team)
+         WHERE s.pre_notify = 1
+           AND m.start_at_kst >= ?
+           AND m.start_at_kst <= ?
+         ORDER BY m.start_at_kst
+        """,
+        (now.isoformat(timespec="seconds"), horizon),
+    ).fetchall()
+    return [_row_to_match(r) for r in rows]
+
+
+def pre_notify_recipients(conn: sqlite3.Connection, match: dict) -> list[int]:
+    """이 매치의 pre 구독자 chat_id 중 아직 시작 알림을 안 받은 사람."""
+    rows = conn.execute(
+        """
+        SELECT s.chat_id FROM subscriptions s
+         WHERE s.pre_notify = 1
+           AND (s.team = ? OR s.team = ?)
+        """,
+        (match["team_a"], match["team_b"]),
+    ).fetchall()
+    key = _pre_key(match["match_id"])
+    seen: set[int] = set()
+    out: list[int] = []
+    for (chat_id,) in rows:
+        if chat_id in seen or is_notified(conn, chat_id, key):
+            continue
+        seen.add(chat_id)
+        out.append(chat_id)
+    return out
+
+
+def pre_notify_text(match: dict) -> str:
+    """시작 알림 문구 (결과 없음 → 스포일러 없음)."""
+    return (
+        f"⏰ 곧 경기 시작 ({PRE_NOTIFY_MINUTES}분 후)\n"
+        f"📅 {match['start_at_kst'][:10]} {match['start_at_kst'][11:16]}  [{match['league']}]\n"
+        f"<b>{match['team_a']} vs {match['team_b']}</b>"
+    )
+
+
+async def pre_notify_worker(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """run_once 로 예약된 개별 매치 시작 알림 발송."""
+    conn: sqlite3.Connection = ctx.application.bot_data["db"]
+    match: dict = ctx.job.data
+    recipients = pre_notify_recipients(conn, match)
+    if not recipients:
+        return
+    log.info("시작 알림 발송 match=%s 대상 %d명", match["match_id"], len(recipients))
+    text = pre_notify_text(match)
+    for chat_id in recipients:
+        try:
+            await ctx.bot.send_message(
+                chat_id=chat_id, text=text,
+                parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+            )
+        except Exception as e:
+            log.warning("시작 알림 실패 chat=%s match=%s err=%s",
+                        chat_id, match["match_id"], e)
+            continue
+        mark_notified(conn, chat_id, _pre_key(match["match_id"]))
+        await asyncio.sleep(NOTIFY_RATE_LIMIT_SEC)
+
+
+def schedule_pre_notifications(app: "Application") -> int:
+    """앞으로 PRE_NOTIFY_SCAN_DAYS 일치 매치의 시작 알림을 run_once 로 예약.
+
+    - 이미 지난(발송 시각이 과거인) 매치는 스킵.
+    - 같은 매치가 이미 예약돼 있으면(job name 중복) 스킵 → 재스캔 안전.
+    반환: 이번에 새로 예약한 건수.
+    """
+    jq = app.job_queue
+    if jq is None:
+        return 0
+    conn: sqlite3.Connection = app.bot_data["db"]
+    now = datetime.now(KST)
+    scheduled = 0
+    for match in find_pre_notify_matches(conn, PRE_NOTIFY_SCAN_DAYS):
+        fire_at = _parse_start(match["start_at_kst"]) - timedelta(minutes=PRE_NOTIFY_MINUTES)
+        if fire_at <= now:
+            continue
+        job_name = f"pre:{match['match_id']}"
+        if jq.get_jobs_by_name(job_name):
+            continue  # 이미 예약됨
+        jq.run_once(pre_notify_worker, when=fire_at, data=match, name=job_name)
+        scheduled += 1
+    if scheduled:
+        log.info("시작 알림 %d건 예약 (앞으로 %d일)", scheduled, PRE_NOTIFY_SCAN_DAYS)
+    return scheduled
+
+
+async def pre_notify_rescan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """하루 1회 재스캔 잡 — 신규 구독/일정 반영 & 재시작 복구."""
+    schedule_pre_notifications(ctx.application)
+
+
 async def notify_worker(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     conn: sqlite3.Connection = ctx.application.bot_data["db"]
     due = find_due_notifications(conn)
@@ -843,6 +1055,40 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if data.startswith("label:"):
         await q.answer()
+        return
+    if data.startswith("sub:"):
+        # sub:<team>:<axis>  — axis in {pre, vod}. 해당 축을 토글/순환 후 패널 갱신.
+        parts = data.split(":")
+        if len(parts) != 3:
+            await q.answer()
+            return
+        _, team, axis = parts
+        chat_id = q.message.chat.id if q.message else None
+        if chat_id is None:
+            await q.answer()
+            return
+        vod, pre = get_subscription(conn, chat_id, team)
+        if axis == "pre":
+            pre = not pre
+        elif axis == "vod":
+            vod = VOD_CYCLE[vod]
+        else:
+            await q.answer()
+            return
+        status = set_subscription(conn, chat_id, team, vod, pre)
+        # 시작 알림을 새로 켰으면 즉시 예약 반영.
+        if pre and axis == "pre":
+            schedule_pre_notifications(ctx.application)
+        if status == "removed":
+            await q.answer("구독 해제됨")
+            await q.edit_message_text(
+                f"<b>{team}</b> 구독을 해제했습니다.",
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            return
+        await q.answer("변경됨")
+        await _render_sub_panel(q, conn, chat_id, team, edit=True)
         return
     if data.startswith("show:"):
         match_id = data.split(":", 1)[1]
@@ -921,6 +1167,15 @@ def main() -> int:
         log.info(
             "알림 워커 등록: %ds 주기, start_at_kst+%dh 경과 매치 발송",
             NOTIFY_INTERVAL_SEC, NOTIFY_DELAY_HOURS,
+        )
+        # 경기 시작 알림: 재스캔 잡이 봇 시작 직후(first=10s) 최초 예약을 하고,
+        # 이후 24h마다 재스캔해 신규 구독/일정 반영 & 재시작 복구.
+        app.job_queue.run_repeating(
+            pre_notify_rescan, interval=timedelta(days=1), first=10
+        )
+        log.info(
+            "시작 알림 재스캔 등록: 24h 주기, 시작 %d분 전 예약 (앞으로 %d일)",
+            PRE_NOTIFY_MINUTES, PRE_NOTIFY_SCAN_DAYS,
         )
 
     log.info("봇 시작")

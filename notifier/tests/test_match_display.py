@@ -124,5 +124,109 @@ class RealDbSmoke(unittest.TestCase):
             self.assertRegex(label, r"\d{4} \d{2}:\d{2}")
 
 
+def _mem_db_with_matches(rows):
+    """인메모리 DB + init_schema + matches 최소 스키마 + 주어진 매치 적재."""
+    conn = sqlite3.connect(":memory:")
+    tb.init_schema(conn)
+    conn.execute(
+        """
+        CREATE TABLE matches (
+          match_id TEXT PRIMARY KEY, league TEXT, season INTEGER, stage TEXT,
+          team_a TEXT, team_b TEXT, start_at_kst TEXT, match_date TEXT,
+          source_file TEXT, imported_at TEXT
+        )
+        """
+    )
+    for r in rows:
+        conn.execute(
+            "INSERT INTO matches (match_id, league, team_a, team_b, start_at_kst, "
+            "match_date, stage) VALUES (?,?,?,?,?,?,?)",
+            (r["match_id"], r.get("league", "LCK"), r["team_a"], r["team_b"],
+             r["start_at_kst"], r["start_at_kst"][:10], r.get("stage", "")),
+        )
+    conn.commit()
+    return conn
+
+
+class SubscriptionToggle(unittest.TestCase):
+    def setUp(self):
+        self.conn = _mem_db_with_matches([])
+
+    def test_vod_cycle_order(self):
+        self.assertEqual(tb.VOD_CYCLE[tb.VOD_OFF], tb.VOD_ALL)
+        self.assertEqual(tb.VOD_CYCLE[tb.VOD_ALL], tb.VOD_WINS)
+        self.assertEqual(tb.VOD_CYCLE[tb.VOD_WINS], tb.VOD_OFF)
+
+    def test_default_is_off(self):
+        self.assertEqual(tb.get_subscription(self.conn, 1, "HLE"), (tb.VOD_OFF, False))
+
+    def test_set_and_roundtrip(self):
+        tb.set_subscription(self.conn, 1, "HLE", tb.VOD_ALL, True)
+        self.assertEqual(tb.get_subscription(self.conn, 1, "HLE"), (tb.VOD_ALL, True))
+        tb.set_subscription(self.conn, 1, "HLE", tb.VOD_WINS, False)
+        self.assertEqual(tb.get_subscription(self.conn, 1, "HLE"), (tb.VOD_WINS, False))
+
+    def test_both_off_removes_row(self):
+        tb.set_subscription(self.conn, 1, "HLE", tb.VOD_ALL, True)
+        status = tb.set_subscription(self.conn, 1, "HLE", tb.VOD_OFF, False)
+        self.assertEqual(status, "removed")
+        self.assertEqual(tb.list_subscriptions(self.conn, 1), [])
+
+    def test_legacy_add_subscription_preserves_pre(self):
+        # 시작 알림만 켠 상태에서 레거시 add_subscription(wins) 호출 → pre 보존
+        tb.set_subscription(self.conn, 1, "HLE", tb.VOD_OFF, True)
+        tb.add_subscription(self.conn, 1, "HLE", wins_only=True)
+        self.assertEqual(tb.get_subscription(self.conn, 1, "HLE"), (tb.VOD_WINS, True))
+
+    def test_migration_idempotent(self):
+        # init_schema를 두 번 돌려도 pre_notify ALTER가 터지지 않아야 함
+        tb.init_schema(self.conn)
+        cols = [r[1] for r in self.conn.execute("PRAGMA table_info(subscriptions)")]
+        self.assertIn("pre_notify", cols)
+
+
+class PreNotify(unittest.TestCase):
+    def _future(self, days, hhmm="19:00"):
+        from datetime import datetime, timedelta
+        d = (datetime.now(tb.KST) + timedelta(days=days)).date().isoformat()
+        return f"{d}T{hhmm}:00+09:00"
+
+    def test_scan_only_includes_subscribed_and_in_window(self):
+        rows = [
+            {"match_id": "m-hle", "team_a": "HLE", "team_b": "GEN",
+             "start_at_kst": self._future(1)},
+            {"match_id": "m-far", "team_a": "HLE", "team_b": "T1",
+             "start_at_kst": self._future(10)},   # 3일 밖
+            {"match_id": "m-other", "team_a": "DK", "team_b": "KT",
+             "start_at_kst": self._future(1)},     # 구독 없음
+        ]
+        conn = _mem_db_with_matches(rows)
+        tb.set_subscription(conn, 1, "HLE", tb.VOD_OFF, True)  # 시작 알림만
+        found = {m["match_id"] for m in tb.find_pre_notify_matches(conn, 3)}
+        self.assertEqual(found, {"m-hle"})
+
+    def test_recipients_excludes_already_notified(self):
+        rows = [{"match_id": "m1", "team_a": "HLE", "team_b": "GEN",
+                 "start_at_kst": self._future(1)}]
+        conn = _mem_db_with_matches(rows)
+        tb.set_subscription(conn, 42, "HLE", tb.VOD_OFF, True)
+        match = tb.find_pre_notify_matches(conn, 3)[0]
+        self.assertEqual(tb.pre_notify_recipients(conn, match), [42])
+        tb.mark_notified(conn, 42, tb._pre_key("m1"))
+        self.assertEqual(tb.pre_notify_recipients(conn, match), [])
+
+    def test_pre_text_has_time_and_no_result(self):
+        match = {"match_id": "m1", "league": "LCK", "team_a": "HLE",
+                 "team_b": "GEN", "start_at_kst": "2026-08-13T19:00:00+09:00",
+                 "stage": "Rounds 3-4"}
+        text = tb.pre_notify_text(match)
+        self.assertIn("19:00", text)
+        self.assertIn("HLE vs GEN", text)
+        self.assertIn("곧 경기 시작", text)
+        # 결과/승패 단어가 없어야 함(스포일러 방지)
+        for spoiler in ("승", "패", "win", "이겼", "졌"):
+            self.assertNotIn(spoiler, text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

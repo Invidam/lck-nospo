@@ -64,6 +64,12 @@ UI에 절대 노출하지 않는 정보:
 - [x] `vod_index/scripts/extract_winners.py` — 인터뷰 영상 제목(`<승팀> <닉> 인터뷰 | A vs B`) 정규식으로 첫 토큰을 승팀으로 추출해 `match_winners(match_date, team_a, team_b, winner, source, source_id, detected_at)` PK + `idx_mw_lookup` 인덱스로 적재. `--only-new`로 미처리 인터뷰만 처리하며 `INSERT OR IGNORE`로 멱등. 인터뷰 publish_date와 실제 경기일이 ±1일 어긋날 수 있어 워커 쿼리에서 윈도우로 흡수.
 - [x] `/subscribe <팀> wins` — 승리 확정된 매치만 알림. 같은 팀이 이미 구독 중이면 wins_only 값을 덮어쓴다. 응답 본문/`/help` 양쪽에 ⚠ 무스포 경고 명시 ("알림이 오는 것 자체가 승리를 알려줍니다"). 워커는 `match_winners` JOIN UNION ALL 분기로 매치업 두 팀 순서 무관·match_date ±1일 윈도우로 발송.
 
+### 텔레그램 봇 (4차 — 경기 시작 알림 + 토글식 구독, 완료)
+- [x] `subscriptions`에 `pre_notify` 컬럼 추가(`init_schema`에서 `ALTER TABLE ... ADD COLUMN` try/except 멱등 마이그레이션). VOD 알림(`wins_only` 축: 끔/전체/이긴 것만)과 **독립된** 시작 알림 축(on/off).
+- [x] `/subscribe <팀>` → **인라인 토글 패널**. `⏰ 시작 알림`(pre_notify 토글) / `📺 VOD`(끔→전체→이긴 것만 순환) 두 버튼. 콜백 `sub:<team>:<axis>`를 `on_callback`이 처리하고 `edit_message`로 패널 갱신. 두 축 다 끄면 구독 row 삭제. 레거시 `/subscribe <팀> wins`도 호환.
+- [x] 경기 시작 알림은 **폴링이 아니라 예약**. `schedule_pre_notifications`가 앞으로 `PRE_NOTIFY_SCAN_DAYS`(3일)치 매치 중 pre 구독자 있는 것을 스캔해 `start_at_kst - PRE_NOTIFY_MINUTES`(10분) 시각에 `JobQueue.run_once(name="pre:<match_id>")` 예약. `pre_notify_worker` 발동 시 pre 구독자에게 발송(결과 없어 스포일러 없음) + `notifications`에 `<match_id>:pre` 키로 기록해 VOD 알림과 분리 중복방지.
+- [x] 재시작 복구 & 신규 구독/일정 반영 — `pre_notify_rescan`을 24h 주기(`first=10s`)로 등록. 봇 시작 직후 최초 예약도 이 잡이 담당. job name 중복 스킵이라 재스캔 안전(멱등). 시작 알림을 새로 켠 순간에도 즉시 재예약.
+
 ### 미래 작업
 - [ ] VOD Resolver 자동화 (세트 timestamp 자동 추출)
 - [ ] 자체 무스포 redirect 페이지 (외부 영상 페이지 스포 차단)
@@ -356,8 +362,8 @@ python schedule/scripts/import_schedule.py data/schedules/rounds-1-2.ics --reset
 | `/schedule` | 팀 선택 키보드 |
 | `/schedule <팀>` | 오늘 이후 다가오는 10경기 |
 | `/subscribe` | 팀 선택 박스 (matches에 등장한 모든 팀) |
-| `/subscribe <팀>` | 구독 추가 — 승패 모두 알림 (대문자 정규화 + 존재 검증) |
-| `/subscribe <팀> wins` | 구독 추가 — 이겼을 때만 알림 (⚠ 알림이 오는 것 자체가 승리 노출) |
+| `/subscribe <팀>` | 인라인 토글 패널 — ⏰ 시작 알림(on/off) / 📺 VOD(끔·전체·이긴 것만 순환) |
+| `/subscribe <팀> wins` | (레거시) VOD 축을 이긴 것만으로 즉시 설정 후 패널 표시 (⚠ 알림 자체가 승리 노출) |
 | `/unsubscribe` | 구독 중인 팀만 박스로 (0개면 안내) |
 | `/unsubscribe <팀>` | 구독 해제 |
 | `/subscriptions` | 내 구독 목록 |
