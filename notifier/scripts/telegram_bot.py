@@ -326,7 +326,7 @@ def build_match_list_keyboard(matches: list[dict]) -> InlineKeyboardMarkup:
     """/team, /schedule용 — 날짜+매치업만, 영상 유무는 숨김."""
     rows = [
         [InlineKeyboardButton(
-            f"📅 {m['start_at_kst'][5:10].replace('-', '')}  [{m['league']}] {m['team_a']} vs {m['team_b']}",
+            f"📅 {m['start_at_kst'][5:10].replace('-', '')} {m['start_at_kst'][11:16]}  [{m['league']}] {m['team_a']} vs {m['team_b']}",
             callback_data=f"show:{m['match_id']}",
         )]
         for m in matches
@@ -336,7 +336,7 @@ def build_match_list_keyboard(matches: list[dict]) -> InlineKeyboardMarkup:
 
 def match_text(match: dict) -> str:
     return (
-        f"📅 {match['start_at_kst'][:10]}  [{match['league']}]\n"
+        f"📅 {match['start_at_kst'][:10]} {match['start_at_kst'][11:16]}  [{match['league']}]\n"
         f"<b>{match['team_a']} vs {match['team_b']}</b>"
     )
 
