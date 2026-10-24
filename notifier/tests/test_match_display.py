@@ -11,6 +11,7 @@ import sqlite3
 import sys
 import types
 import unittest
+from unittest.mock import Mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -35,12 +36,20 @@ def _install_telegram_stub() -> None:
         def __init__(self, *a, **k):
             pass
 
+    class KeyboardButton:
+        def __init__(self, text, **kw):
+            self.text = text
+
+    class ReplyKeyboardMarkup:
+        def __init__(self, keyboard, **kw):
+            self.keyboard = keyboard
+
     telegram = types.ModuleType("telegram")
     telegram.BotCommand = _Stub
     telegram.InlineKeyboardButton = InlineKeyboardButton
     telegram.InlineKeyboardMarkup = InlineKeyboardMarkup
-    telegram.KeyboardButton = _Stub
-    telegram.ReplyKeyboardMarkup = _Stub
+    telegram.KeyboardButton = KeyboardButton
+    telegram.ReplyKeyboardMarkup = ReplyKeyboardMarkup
     telegram.Update = _Stub
 
     constants = types.ModuleType("telegram.constants")
@@ -185,7 +194,62 @@ class SubscriptionToggle(unittest.TestCase):
         self.assertIn("pre_notify", cols)
 
 
+class TeamPickers(unittest.TestCase):
+    def test_all_team_pickers_show_exactly_lck_ten(self):
+        conn = _mem_db_with_matches([
+            {"match_id": "worlds", "team_a": "G2", "team_b": "KC",
+             "start_at_kst": "2026-10-25T02:00:00+09:00", "league": "WORLDS"},
+        ])
+        for command in ("/watch", "/schedule", "/subscribe"):
+            keyboard = tb.build_team_picker_keyboard(conn, command)
+            labels = [button.text for row in keyboard.keyboard for button in row]
+            self.assertEqual(labels, [f"{command} {team}" for team in tb.LCK_TEAMS] + ["/help"])
+            self.assertEqual(len(tb.LCK_TEAMS), 10)
+        conn.close()
+
+    def test_unsubscribe_picker_only_shows_subscribed_lck_teams(self):
+        conn = _mem_db_with_matches([])
+        tb.set_subscription(conn, 42, "G2", tb.VOD_ALL, False)
+        self.assertIsNone(tb.build_unsubscribe_picker_keyboard(conn, 42))
+        tb.set_subscription(conn, 42, "HLE", tb.VOD_ALL, False)
+        keyboard = tb.build_unsubscribe_picker_keyboard(conn, 42)
+        labels = [button.text for row in keyboard.keyboard for button in row]
+        self.assertEqual(labels, ["/unsubscribe HLE", "/help"])
+        self.assertEqual(len(tb.list_subscriptions(conn, 42)), 2)
+        conn.close()
+
+
 class PreNotify(unittest.TestCase):
+    def test_schedule_changes_replace_existing_job(self):
+        match = {"match_id": "m1", "team_a": "HLE", "team_b": "GEN",
+                 "start_at_kst": self._future(1)}
+        conn = _mem_db_with_matches([match])
+        tb.set_subscription(conn, 42, "HLE", tb.VOD_OFF, True)
+        app = Mock()
+        app.bot_data = {"db": conn}
+        old_job = Mock()
+        old_job.data = {**match, "start_at_kst": self._future(1, "18:00")}
+        app.job_queue.get_jobs_by_name.return_value = (old_job,)
+        self.assertEqual(tb.schedule_pre_notifications(app), 1)
+        old_job.schedule_removal.assert_called_once()
+        self.assertEqual(app.job_queue.run_once.call_args.kwargs["data"]["start_at_kst"], match["start_at_kst"])
+        conn.close()
+
+    def test_unchanged_schedule_keeps_existing_job(self):
+        match = {"match_id": "m1", "team_a": "HLE", "team_b": "GEN",
+                 "start_at_kst": self._future(1)}
+        conn = _mem_db_with_matches([match])
+        tb.set_subscription(conn, 42, "HLE", tb.VOD_OFF, True)
+        app = Mock()
+        app.bot_data = {"db": conn}
+        old_job = Mock()
+        old_job.data = tb.find_pre_notify_matches(conn, 3)[0]
+        app.job_queue.get_jobs_by_name.return_value = (old_job,)
+        self.assertEqual(tb.schedule_pre_notifications(app), 0)
+        old_job.schedule_removal.assert_not_called()
+        app.job_queue.run_once.assert_not_called()
+        conn.close()
+
     def _future(self, days, hhmm="19:00"):
         from datetime import datetime, timedelta
         d = (datetime.now(tb.KST) + timedelta(days=days)).date().isoformat()

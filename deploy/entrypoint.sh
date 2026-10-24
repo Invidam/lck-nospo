@@ -5,6 +5,7 @@
 # 두 상시/배치 컴포넌트를 MODE 로 분기한다:
 #   MODE=bot   (기본) : (부트스트랩) → 텔레그램 봇 상시 polling
 #   MODE=fetch        : VOD 수집 파이프라인 1회 실행 후 종료 (cron 배치용)
+#   MODE=schedule     : 구독형 Worlds 일정 동기화 1회 실행 후 종료
 #
 # 데이터는 볼륨(/data)의 단일 SQLite(videos.sqlite)에 모인다.
 # 봇과 fetch 컨테이너가 같은 볼륨을 공유한다 (stock-routine 의 portfolio.db 와 동형).
@@ -27,6 +28,10 @@ echo "=== lck-nospo 진입점 (MODE=$MODE) ==="
 echo "  DB : $LCK_DB_PATH"
 
 run_pipeline() {
+  "$PY" schedule/scripts/sync_ical_schedule.py \
+    --season "${LCK_SCHEDULE_SEASON:-2026}" \
+    --from-date "${LCK_SCHEDULE_FROM_DATE:-2026-10-24}" \
+    --apply || echo "  일정 동기화 실패: schedule_sync_runs 확인 (계속)"
   # 두 치지직 채널 fetch → classify(신규) → winners(신규).
   # 한 채널 실패해도 다음 채널 시도 (부분 장애 내성).
   echo "--- [fetch] 치지직 VOD 수집 파이프라인 ---"
@@ -47,6 +52,16 @@ CHZZK_CHANNELS=(
 if [ "$MODE" = "fetch" ]; then
   run_pipeline
   echo "=== MODE=fetch : 수집 완료, 종료 ==="
+  exit 0
+fi
+
+# ---- MODE=schedule : Worlds 일정 동기화 후 종료 ---------------------------
+if [ "$MODE" = "schedule" ]; then
+  "$PY" schedule/scripts/sync_ical_schedule.py \
+    --season "${LCK_SCHEDULE_SEASON:-2026}" \
+    --from-date "${LCK_SCHEDULE_FROM_DATE:-2026-10-24}" \
+    --apply
+  echo "=== MODE=schedule : 일정 동기화 완료, 종료 ==="
   exit 0
 fi
 

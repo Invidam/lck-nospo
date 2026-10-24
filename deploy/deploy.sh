@@ -86,7 +86,7 @@ if [ "$DO_BUILD" -eq 1 ]; then
   rsync -az --delete \
     --exclude '.venv' --exclude '.git' --exclude '__pycache__' \
     --exclude '*.pyc' --exclude '.pytest_cache' --exclude '.idea' \
-    --exclude 'data/vods/*.sqlite*' --exclude 'data/identifier.sqlite' \
+    --exclude '*.sqlite*' \
     --exclude '.env' \
     "$ROOT/" "$HOST:$TMP_SRC/"
   ssh "$HOST" "tar -C $TMP_SRC -cf - . | pct exec $CTID -- bash -c 'rm -rf $SRC_DIR && mkdir -p $SRC_DIR && tar -C $SRC_DIR -xf -'; rm -rf $TMP_SRC"

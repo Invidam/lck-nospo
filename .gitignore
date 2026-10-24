@@ -14,6 +14,7 @@ data/vods/*.sqlite
 data/vods/*.sqlite-journal
 data/vods/*.sqlite-wal
 data/vods/*.sqlite-shm
+data/vods/backups/
 
 # IDE 부산물 (PyCharm DataGrip 등이 만드는 빈 SQLite)
 data/identifier.sqlite

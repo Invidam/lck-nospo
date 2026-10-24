@@ -15,7 +15,7 @@ LCK/VCT 등 e스포츠 경기를 **스포일러 없이** 다시볼 수 있는 �
 
 ## 무엇을 하는가
 
-1. **일정 수집** — Leaguepedia(fandom) MatchCalendar에서 LCK/VCT 일정을 수집
+1. **일정 수집** — LCK/RTE는 Leaguepedia CSV 적재, Worlds는 공개 iCalendar 피드를 어댑터로 자동 수집
 2. **VOD 매칭** — 매치업 + 날짜 기반으로 YouTube / 치지직 / SOOP VOD를 찾아 연결
 3. **무스포 표시** — 매치업("GEN vs HLE")과 날짜만 보여주고 나머지 메타데이터는 모두 차단
 4. **무스포 재생** — BO5 전체를 하나의 가상 타임라인으로 이어 재생, 진행바 / 세트 수 / 남은 길이 숨김
@@ -43,11 +43,12 @@ UI에 절대 노출하지 않는 정보:
 - [x] 팀별 일정 필터링 스크립트 (`schedule/scripts/extract_team_schedule.py`)
 - [x] VALARM 포함 iCalendar 변환 (`schedule/scripts/csv_to_ics.py`)
 - [x] 일정 → SQLite `matches` 테이블 import (`schedule/scripts/import_schedule.py`)
+- [x] Worlds 구독형 iCalendar 동기화 + 실행 이력 (`sync_ical_schedule.py`, `schedule_sync_runs`)
 - [x] 치지직 VOD 목록 수집 어댑터 (`vod_index/scripts/fetch_chzzk_vods.py`, backend 전용)
 - [x] 영상 제목 파싱 분류 (`vod_index/scripts/classify_videos.py` → `video_classifications`)
 
 ### 텔레그램 봇 (1차 완료)
-- [x] `/watch` — 팀 선택 키보드 (matches에 등장한 팀들을 2열 그리드로)
+- [x] `/watch` — LCK 10팀 선택 키보드 (2열 그리드, 일정·구독 선택도 동일)
 - [x] `/watch <팀>` — 오늘까지 최근 10경기 리스트 (날짜+매치업만, 영상 유무 숨김)
 - [x] `/watch <MMDD> <팀>` / `/watch <MMDD> <팀A> <팀B>` — 5세트 × (하이라이트/풀영상) 슬롯 그리드. 빈 슬롯도 동일하게 노출.
 - [x] `/schedule` — 팀 선택 키보드
@@ -68,7 +69,7 @@ UI에 절대 노출하지 않는 정보:
 - [x] `subscriptions`에 `pre_notify` 컬럼 추가(`init_schema`에서 `ALTER TABLE ... ADD COLUMN` try/except 멱등 마이그레이션). VOD 알림(`wins_only` 축: 끔/전체/이긴 것만)과 **독립된** 시작 알림 축(on/off).
 - [x] `/subscribe <팀>` → **인라인 토글 패널**. `⏰ 시작 알림`(pre_notify 토글) / `📺 VOD`(끔→전체→이긴 것만 순환) 두 버튼. 콜백 `sub:<team>:<axis>`를 `on_callback`이 처리하고 `edit_message`로 패널 갱신. 두 축 다 끄면 구독 row 삭제. 레거시 `/subscribe <팀> wins`도 호환.
 - [x] 경기 시작 알림은 **폴링이 아니라 예약**. `schedule_pre_notifications`가 앞으로 `PRE_NOTIFY_SCAN_DAYS`(3일)치 매치 중 pre 구독자 있는 것을 스캔해 `start_at_kst - PRE_NOTIFY_MINUTES`(10분) 시각에 `JobQueue.run_once(name="pre:<match_id>")` 예약. `pre_notify_worker` 발동 시 pre 구독자에게 발송(결과 없어 스포일러 없음) + `notifications`에 `<match_id>:pre` 키로 기록해 VOD 알림과 분리 중복방지.
-- [x] 재시작 복구 & 신규 구독/일정 반영 — `pre_notify_rescan`을 24h 주기(`first=10s`)로 등록. 봇 시작 직후 최초 예약도 이 잡이 담당. job name 중복 스킵이라 재스캔 안전(멱등). 시작 알림을 새로 켠 순간에도 즉시 재예약.
+- [x] 재시작 복구 & 신규 구독/일정 반영 — `pre_notify_rescan`을 5분 주기(`first=10s`)로 등록. 일정이 같으면 예약을 유지하고, 시각·대진이 바뀌면 예약을 교체한다. 시작 알림을 새로 켠 순간에도 즉시 예약.
 
 ### 미래 작업
 - [ ] VOD Resolver 자동화 (세트 timestamp 자동 추출)
@@ -84,7 +85,8 @@ lck-nospo/
 │   └── scripts/
 │       ├── extract_team_schedule.py  # 팀별 일정 필터링 (CSV → CSV)
 │       ├── csv_to_ics.py             # VALARM 포함 iCalendar 변환 (CSV → 진짜 .ics)
-│       └── import_schedule.py        # CSV → SQLite import
+│       ├── import_schedule.py        # CSV → SQLite import
+│       └── sync_ical_schedule.py     # 공개 iCalendar → 검증 → SQLite 동기화
 ├── vod_index/                      # VOD 인덱스 영역 (backend 전용)
 │   └── scripts/
 │       ├── fetch_chzzk_vods.py       # 치지직 VOD 목록 수집 (→ data/vods/videos.sqlite)
@@ -107,14 +109,14 @@ lck-nospo/
 
 ## 일정 데이터 소스
 
-Leaguepedia의 MatchCalendarExport를 사용한다.
+LCK/RTE 시드 일정은 Leaguepedia의 MatchCalendarExport를 사용한다.
 
 - 검색 URL: <https://lol.fandom.com/wiki/Special:RunQuery/MatchCalendarExport?pfRunQueryFormName=MatchCalendarExport&MCE%5B1%5D=LCK+2026&wpRunQuery=&pf_free_text=>
   - `MCE[1]=LCK 2026` 처럼 시즌을 넣고 실행하면 그 시즌 경기가 `Subject,Start Date,Start Time` CSV로 나온다.
 - 폼에서 토너먼트(예: `LCK 2026 Rounds 3-4`)를 선택하면 CSV/ICS export 가능
 - 받은 파일은 `data/schedules/<라운드>.ics` 로 저장 (확장자는 `.ics`지만 내용은 CSV)
 
-> ⚠️ **일정은 자동 갱신되지 않는다.** VOD 수집(`fetch`)은 cron이 돌지만, `matches`(경기 일정)는
+> ⚠️ **LCK/RTE의 CSV 일정은 자동 갱신되지 않는다.** `matches`의 LCK/RTE 일정은
 > Leaguepedia에서 **사람이 새 라운드 .ics를 export해서 넣어줘야** 한다. 새 라운드가 시작되면
 > 위 URL에서 export → `data/schedules/`에 저장 → 아래 "일정 갱신" 절차로 반영한다.
 > 안 하면 봇의 `/watch`·`/schedule`이 옛 라운드에서 멈춘 것처럼 보인다.
@@ -139,6 +141,67 @@ ssh root@192.168.0.29 "pct exec 202 -- docker exec lck-nospo-bot python schedule
 
 > 리그 prefix(`LCK 2026 ...` → `LCK`)는 `schedule/scripts/import_schedule.py`의 `LEAGUE_PREFIXES`가
 > 매핑한다. 매핑에 없는 새 대회는 조용히 스킵되므로, 새 리그가 들어오면 거기에 한 줄 추가한다.
+
+### 2026 Worlds 구독형 피드 전환
+
+Worlds는 PandaScore 기반 공개 iCalendar 피드를 `sync_ical_schedule.py`로 동기화한다.
+이는 PandaScore API 직접 호출이 아니라 토큰 없이 공개 URL을 읽는 어댑터다. 원본 피드는
+하루 한 번 생성되므로 수집 주기를 짧게 해도 원본의 갱신 지연은 남는다.
+
+운영에서는 기존 `MODE=fetch` 배치가 일정 동기화 → 두 채널 VOD 수집 → 분류 → 승팀 추출을
+차례로 수행한다. 별도 일정 cron은 추가하지 않는다. 맥의 `bin/run_fetch_pipeline.sh`도 같은
+일정 동기화 단계를 실행한다. 일정 수집이 실패해도 VOD 단계는 계속 실행된다.
+초기 도입 범위는 KST 2026-10-24 이후 확정 경기다.
+
+```bash
+# 1. 실제 DB를 바꾸지 않는 드라이런
+.venv/bin/python schedule/scripts/sync_ical_schedule.py \
+  --season 2026 --from-date 2026-10-24
+
+# 2. Leaguepedia에서 받은 동일 대회 CSV와 미래 일정 비교
+.venv/bin/python schedule/scripts/sync_ical_schedule.py \
+  --season 2026 \
+  --compare-csv data/schedules/worlds-2026.ics \
+  --from-date 2026-10-24 --verbose
+
+# 3. 비교 통과 후 로컬 임시 DB canary
+LCK_DB_PATH=/tmp/worlds.sqlite .venv/bin/python \
+  schedule/scripts/sync_ical_schedule.py \
+  --season 2026 --from-date 2026-10-24 --apply
+
+# 4. 선택한 DB 반영 (미지정 시 로컬 DB, 서버는 deploy/README.md 참조)
+.venv/bin/python schedule/scripts/sync_ical_schedule.py \
+  --season 2026 --from-date 2026-10-24 --apply
+```
+
+비교는 `날짜 + 순서 무관 매치업 + 시작 시각`을 기준으로 한다. 피드에 기존 CSV 경기가
+빠졌거나 시작 시각이 다르면 exit 2로 중단하며, 새 피드에만 미래 경기가 더 있는 것은 허용한다.
+완료된 경기는 실제 시작 시각으로 보정될 수 있으므로 전환 비교에는 `--from-date`로 미래 일정만
+넣는다.
+
+동기화 시 외부 `UID`를 `schedule_events`에 저장한다. 이미 적재된 동일 날짜·매치업이 정확히
+하나면 기존 `match_id`를 보존해 연결하고, 둘 이상이면 추측하지 않고 충돌로 남긴다. `TBD` 대진,
+종료 시각, 경기 길이, 스코어·승자 정보는 저장하지 않는다. 실행 이력은
+`schedule_sync_runs`에서 확인한다.
+
+조회 실패·파싱 실패도 `failed`, 모호한 기존 경기 연결은 전체 롤백 후 `rejected`로 기록한다.
+빈 CSV는 비교 통과로 인정하지 않는다. `TL → TLAW`, `LY → LYON`은 VOD와 같은 약어로 정규화한다.
+기존 LCK/RTE CSV의 날짜·매치업·시각은 기존 importer와 새 비교기의 출력이 일치하는 회귀 테스트로
+검증한다. Worlds Leaguepedia CSV 원본은 없어 두 소스 간 실제 Worlds 동등성은 아직 검증하지 못했다.
+전환 시 원격 DB 복제본에서 기존 144건 보존·16건 추가·재실행 멱등성과 10/24 VOD 연결 8경기를 검증했다.
+
+```sql
+SELECT id, started_at, finished_at, status, scanned_count, eligible_count,
+       inserted_count, updated_count, unchanged_count, conflict_count, error
+FROM schedule_sync_runs ORDER BY id DESC LIMIT 10;
+```
+
+설계와 운영 점검은 [일정 수집 가이드](schedule/README.md)를 참고한다.
+
+서버는 UTC다. `deploy/crontab`은 UTC 기준으로 작성하여 KST 01~12시(Worlds)·17~23시에는
+7분마다, 나머지 시간에는 매시간 같은 일정·VOD 파이프라인을 실행한다. 10/25 HLE 일정은
+이미 저장돼 있으므로 경기 후에는 치지직 게시 → 다음 수집·분류 후 다시보기 링크가 연결된다.
+Google Calendar 앱의 구독 갱신은 이 봇과 별개이며 봇은 Google Calendar를 거치지 않는다.
 
 ## 사용법
 
@@ -240,28 +303,22 @@ python vod_index/scripts/fetch_chzzk_vods.py 9381e7d6816e6d915a44a13c0195b202 --
 
 매 실행은 `fetch_runs` 테이블에 기록된다(시작/종료 시각, 페이지 수, 신규/업데이트 건수, status, error). cron이나 `/loop`으로 주기 실행하면 신규 VOD만 누적된다.
 
-#### 권장 수집 스케줄 (cron)
+#### 운영 수집 스케줄 (서버 UTC 기준)
 
-LCK 정규 일정 기준: 수~일 17~24시 KST에 영상이 몰리고, 월/화는 휴방. 경기 시간엔 빠르게(7분), 그 외엔 느슨하게(1시간) 도는 2-룰 구성을 권장한다.
+운영 설정의 정본은 `deploy/crontab`이다. KST 01~12시(Worlds 새벽)·17~23시에는 매일 7분마다,
+나머지 시간에는 매시간 `MODE=fetch` 컨테이너를 실행한다. 서버 cron 필드는 UTC로 환산되어 있다.
 
 **`fetch` 직후 항상 `classify --only-new` + `extract_winners --only-new`를 같이 돌린다.** fetch만 돌리면 신규 영상이 `videos`엔 들어가지만 `video_classifications` / `match_winners`에는 안 들어가서 봇 그리드 및 `wins_only` 알림이 안 잡힌다. 두 채널 모두 fetch한 뒤 마지막에 classify/winners를 한 번씩 돌리는 게 효율적이라 wrapper 스크립트(`bin/run_fetch_pipeline.sh`)에 묶어 두었다. cron/LaunchAgent 한 줄에서는 wrapper만 호출.
 
-```cron
-# 경기 시간대: 수~일 17~23시, 7분마다
-*/7 17-23 * * 3-7  /path/to/lck-nospo/bin/run_fetch_pipeline.sh
+일정 동기화 → 두 채널(LCK 공식 + EWC 공식) fetch → `classify_videos.py --only-new` →
+`extract_winners.py --only-new` 순서다. 일정/한 채널 fetch가 실패해도 다음 단계를 시도한다.
+실행 이력은 `schedule_sync_runs`·`fetch_runs`·`classify_runs`·`winners_runs`, 서버 콘솔 로그는
+`/var/log/lck-nospo-fetch.log`에서 확인한다. 맥 wrapper의 로그는 `/tmp/chzzk-fetch.log`다.
 
-# 안전망: 매일 00~16시 정각 + 월/화 매시간 (늦은 업로드 / 휴방일 커버)
-0 0-16 * * *       /path/to/lck-nospo/bin/run_fetch_pipeline.sh
-0 * * * 1,2        /path/to/lck-nospo/bin/run_fetch_pipeline.sh
-```
-
-`bin/run_fetch_pipeline.sh`는 두 채널(LCK 공식 + EWC 공식)을 순차 fetch한 뒤 `classify_videos.py --only-new`와 `extract_winners.py --only-new`를 돌리고 `/tmp/chzzk-fetch.log`에 누적 기록한다. 한 채널 fetch가 실패해도 다음 채널은 시도하므로 부분 장애에 강하다.
-
-- 요일 번호: 일=0/7, 월=1, ..., 토=6 (Linux/macOS 공통)
 - 증분 수집이라 신규 0건일 땐 page 1만 보고 종료하므로 부하 거의 없음. `classify --only-new`도 미분류 0건이면 즉시 종료.
 - 실패 감지: `SELECT * FROM fetch_runs WHERE status='failed' ORDER BY started_at DESC LIMIT 10`
 
-#### macOS LaunchAgent로 운영 (현재 방식)
+#### macOS LaunchAgent로 운영 (로컬 대안)
 
 운영 환경이 맥인 경우 cron 대신 `launchd`를 사용한다. cron과 달리 시스템이 sleep 중일 때 놓친 트리거를 깨어났을 때 따라잡아 실행한다. plist 3개가 `~/Library/LaunchAgents/com.invidam.lck-nospo.fetch-{gameday,hourly,montue}.plist`에 등록돼 있다. 모두 `bin/run_fetch_pipeline.sh`를 호출한다.
 
@@ -361,7 +418,7 @@ python schedule/scripts/import_schedule.py data/schedules/rounds-1-2.ics --reset
 | `/watch <MMDD> <팀A> <팀B>` | 특정 매치업 → 5세트 × (하이라이트/풀영상) 그리드 |
 | `/schedule` | 팀 선택 키보드 |
 | `/schedule <팀>` | 오늘 이후 다가오는 10경기 |
-| `/subscribe` | 팀 선택 박스 (matches에 등장한 모든 팀) |
+| `/subscribe` | LCK 10팀 선택 박스 |
 | `/subscribe <팀>` | 인라인 토글 패널 — ⏰ 시작 알림(on/off) / 📺 VOD(끔·전체·이긴 것만 순환) |
 | `/subscribe <팀> wins` | (레거시) VOD 축을 이긴 것만으로 즉시 설정 후 패널 표시 (⚠ 알림 자체가 승리 노출) |
 | `/unsubscribe` | 구독 중인 팀만 박스로 (0개면 안내) |

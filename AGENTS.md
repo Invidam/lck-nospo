@@ -39,7 +39,8 @@ schedule/                   # ① 캘린더 뽑기/변환/DB 정규화 적재 (�
 └── scripts/
     ├── extract_team_schedule.py   # CSV → 팀별 CSV
     ├── csv_to_ics.py              # CSV → 진짜 iCalendar (+ VALARM)
-    └── import_schedule.py         # CSV → data/vods/videos.sqlite::matches
+    ├── import_schedule.py         # CSV → data/vods/videos.sqlite::matches
+    └── sync_ical_schedule.py      # 구독형 iCalendar → 검증/비교 → matches
 
 vod_index/                  # ② VOD 메타데이터 수집/분류 (코드, backend 전용)
 └── scripts/
@@ -107,6 +108,21 @@ winners_runs(
   matched_count,               -- 첫 토큰이 매치업 두 팀 중 하나와 매칭된 건수
   skipped_count,               -- 첫 토큰이 매치업과 안 맞아 스킵된 건수
   inserted_count,              -- match_winners에 새로 들어간 행 수
+  status, error
+)
+
+schedule_events(
+  source, source_event_id,     -- 외부 피드의 안정적인 이벤트 식별자
+  match_id,                    -- 기존 matches 행과 연결, 일정 변경에도 유지
+  first_seen, last_seen
+)
+
+schedule_sync_runs(
+  id, source, source_key,
+  started_at, finished_at,
+  scanned_count, eligible_count, adopted_count,
+  inserted_count, updated_count, unchanged_count,
+  skipped_count, conflict_count,
   status, error
 )
 ```
@@ -187,13 +203,12 @@ cp .env.example .env   # TELEGRAM_BOT_TOKEN 채우기
   - LCK 공식 (정규시즌): `9381e7d6816e6d915a44a13c0195b202`
   - EWC 공식 (RTE/Road to EWC): `fce7c8735e0646e642007198a8875882`
 
-운영 스케줄은 `bin/run_fetch_pipeline.sh` wrapper로 묶어 macOS LaunchAgent 3개로 실행 중이다.
-- 경기 시간대(수~일 17~23시 KST): 7분마다 (gameday)
-- 그 외 시간(매일 0-16시 정각): 매시간 (hourly)
-- 휴방일 안전망(월/화 매시간): (montue)
-- **wrapper가 두 채널을 순차 fetch → `classify_videos.py --only-new` → `extract_winners.py --only-new`까지 한 번에 처리한다.** 한 채널 fetch가 실패해도 다음 채널은 시도, 파이프라인 뒷단은 계속 돈다.
-- plist: `~/Library/LaunchAgents/com.invidam.lck-nospo.fetch-{gameday,hourly,montue}.plist`
-- 자세한 표 / `launchctl` 사용은 README "권장 수집 스케줄" 참조
+운영은 서버의 `MODE=fetch` 배치이며 정본은 `deploy/crontab`이다(서버 UTC).
+- KST 01~12시·17~23시: 매일 7분마다. 나머지는 매시간.
+- Worlds 일정 동기화 → 두 채널 fetch → `classify_videos.py --only-new` → `extract_winners.py --only-new`.
+- 일정/한 채널 수집 실패에도 다음 단계를 시도한다. 일정은 HTTP 요청 전부터 `schedule_sync_runs`에 기록한다.
+- 맥 `bin/run_fetch_pipeline.sh`는 같은 흐름의 로컬 대안이다. 기존 LaunchAgent와 서버 중복 실행에 주의.
+- 일정 설계·제약은 `schedule/README.md`, 운영 결과·버전은 `deploy/STATUS.md` 참조.
 
 ### VOD 매칭 작업 (향후)
 - 매칭은 **반드시 backend에서만 실행**
@@ -214,14 +229,14 @@ cp .env.example .env   # TELEGRAM_BOT_TOKEN 채우기
 - 메시지 전송 시 항상 `disable_web_page_preview=True`.
 
 #### 현재 구현된 명령어
-- `/watch` — 팀 선택 키보드(`matches`에 등장한 팀들을 2열 그리드로). 누르면 `/watch <팀>` 자동 전송.
+- `/watch` — LCK 10팀 선택 키보드(2열 그리드). 누르면 `/watch <팀>` 자동 전송.
 - `/watch <팀>` — 최근 10경기 (날짜+매치업만, 영상 유무 숨김)
 - `/watch <MMDD> <팀>` 또는 `/watch <MMDD> <팀A> <팀B>` — 매치 찾기 → 5세트 그리드
 - `/schedule` — 팀 선택 키보드 (다가오는 경기용)
 - `/schedule <팀>` — 오늘 이후 다가오는 10경기
-- `/subscribe` — 팀 선택 박스(matches에 등장한 모든 팀). 누르면 `/subscribe <팀>` 자동 전송.
+- `/subscribe` — LCK 10팀 선택 박스. 누르면 `/subscribe <팀>` 자동 전송.
 - `/subscribe <팀>` — 대문자 정규화 후 matches 존재 검증 → `subscriptions`에 `INSERT OR IGNORE`.
-- `/unsubscribe` — 현재 chat_id가 구독 중인 팀만 박스로. 0개면 안내 메시지.
+- `/unsubscribe` — 현재 chat_id가 구독 중인 LCK 팀만 박스로. 0개면 안내 메시지. 기존 다른 팀 구독은 유지하며 직접 입력으로 해제 가능.
 - `/unsubscribe <팀>` — 해당 구독 DELETE.
 - `/subscriptions` — 내 구독 목록 텍스트.
 - `/help`, `/start` — 안내 + 하단 영구 키보드(`/watch` `/schedule` `/subscribe` `/subscriptions` `/unsubscribe` `/help`, 3행 구성)
@@ -274,10 +289,12 @@ cp .env.example .env   # TELEGRAM_BOT_TOKEN 채우기
 공통 배포 규칙(단일 이미지 + `MODE` 분기, Docker-in-LXC, 필수 run 옵션 등)은 정본
 `~/PycharmProjects/vimos/shared/CONVENTIONS.md` §2·§4 참조. 아래는 lck 고유 사항:
 
-- **상시 = `MODE=bot`**(텔레그램 봇 polling), **배치 = `MODE=fetch`**(VOD 증분 수집 후 종료).
+- **상시 = `MODE=bot`**(텔레그램 봇 polling), **배치 = `MODE=fetch`**(VOD 증분 수집 후 종료),
+  **일정 수동 실행 = `MODE=schedule`**(구독형 Worlds 일정 동기화 후 종료).
+  `MODE=fetch`는 Worlds 일정 동기화를 먼저 수행하고 VOD 수집을 진행한다.
   `deploy/entrypoint.sh` 가 분기하고, 봇 최초 기동 시 DB 가 비어 있으면 일정 import +
   초기 수집으로 부트스트랩한다.
-- **DB 경로는 `LCK_DB_PATH` env 로 override**. 봇·fetch·classify·winners·import 5개
+- **DB 경로는 `LCK_DB_PATH` env 로 override**. 봇·fetch·classify·winners·import·schedule sync 6개
   스크립트가 이 변수를 존중하고, 미설정 시 로컬 `data/vods/videos.sqlite` 로 폴백.
 - **배포**: `./deploy/deploy.sh` (CTID 기본 202=`ct-bots`). `--fetch` 로 수집 1회,
   `--no-build` 로 재기동만. 운영 좌표·현황은 `deploy/STATUS.md`.
@@ -286,6 +303,15 @@ cp .env.example .env   # TELEGRAM_BOT_TOKEN 채우기
 
 ## Changelog
 
+- **2026-10-24** — 팀 선택기를 LCK 10팀으로 고정. UTC 서버의 cron 시각 오설정을 바로잡고
+  Worlds 새벽 포함 KST 01~12·17~23시에는 7분마다 일정·VOD 통합 파이프라인 실행.
+- **2026-10-24** — Worlds 피드 수집을 기존 `MODE=fetch`/맥 wrapper에 통합(별도 cron 없음).
+  HTTP·파싱 실패까지 `schedule_sync_runs`에 기록, 연결 충돌 시 전체 롤백.
+  TL→TLAW·LY→LYON 정규화와 10/24 VOD 8경기 연결 검증.
+  시작 알림 재스캔을 5분으로 변경하고 일정 변경 시 예약 교체. 설계는 `schedule/README.md` 참조.
+- **2026-10-24** — 2026 Worlds 구독형 iCalendar 어댑터 추가. 기본 드라이런,
+  Leaguepedia CSV 비교, 외부 UID 기반 멱등 upsert, 기존 `match_id` 보존 연결,
+  충돌 중단 및 `schedule_sync_runs` 운영 로그를 도입.
 - **2026-08-02** — Docker 배포 도입. `deploy/` 세트(Dockerfile·entrypoint·deploy.sh·
   crontab·README·STATUS) 추가, 5개 스크립트에 `LCK_DB_PATH` env override.
   LXC 202(`ct-bots`)에 최초 배포 완료 — 봇 상시 + cron 수집.

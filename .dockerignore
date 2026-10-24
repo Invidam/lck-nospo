@@ -17,6 +17,7 @@ data/vods/*.sqlite-journal
 data/vods/*.sqlite-wal
 data/vods/*.sqlite-shm
 data/identifier.sqlite
+**/*.sqlite*
 
 # IDE / VCS
 .idea/

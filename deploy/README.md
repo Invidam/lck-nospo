@@ -7,12 +7,13 @@
 > Docker-in-LXC)이다. 두 프로젝트 공통 규칙(정본)은
 > `~/PycharmProjects/vimos/shared/CONVENTIONS.md` 참고 (AGENTS.md 가 import).
 
-## 두 컴포넌트 (모두 서버 컨테이너에서)
+## 실행 모드 (모두 같은 서버 이미지에서)
 
 | 역할 | 실행 | 스크립트 |
 |------|------|----------|
 | 텔레그램 봇 (상시 polling) | `MODE=bot` | `notifier/scripts/telegram_bot.py` |
-| VOD 링크 수집 (주기 배치) | `MODE=fetch` | `bin/run_fetch_pipeline.sh` 상당의 3단계 |
+| 일정·VOD 수집 (기존 주기 배치) | `MODE=fetch` | Worlds 일정 → 두 채널 fetch → classify → winners |
+| Worlds 일정 수동 재실행 | `MODE=schedule` | `schedule/scripts/sync_ical_schedule.py` |
 
 VOD 수집 배치는 **치지직 채널의 공개 VOD 목록(제목·URL·게시일)을 긁어와 DB에 쌓는**
 인덱싱 작업이다. 영상 파일을 받는 게 아니라 링크/메타만 모은다. 3단계로 구성:
@@ -21,9 +22,10 @@ VOD 수집 배치는 **치지직 채널의 공개 VOD 목록(제목·URL·게시
 2. `classify_videos.py --only-new` — 제목 파싱 → 세트/유형 분류
 3. `extract_winners.py --only-new` — 인터뷰 제목에서 승팀 추출 (wins 알림용)
 
-`entrypoint.sh` 가 둘을 `MODE` 로 묶는다:
+`entrypoint.sh`가 `MODE`로 실행을 분기한다:
 - `MODE=bot` (기본): (최초면 부트스트랩) → 봇 상시 polling
 - `MODE=fetch`: 수집 파이프라인 1회 실행 후 종료 (cron 배치용)
+- `MODE=schedule`: 2026 Worlds 구독형 일정 동기화 1회 실행 후 종료
 
 **부트스트랩**: 볼륨의 DB가 비어 있으면(최초 배포) 봇을 띄우기 전에
 이미지 동봉 `data/schedules/*.ics` 를 `matches` 로 import 하고 수집을 1회 돌린다.
@@ -63,12 +65,12 @@ crontab deploy/crontab     # 등록
 crontab -l                 # 확인
 ```
 
-- 경기 시간대(수~일 17~23시 KST)엔 7분마다, 그 외엔 느슨하게 `MODE=fetch` 컨테이너가
+- KST 01~12시(Worlds)·17~23시에는 매일 7분마다, 나머지 시간에는 매시간 `MODE=fetch` 컨테이너가
   떠서 신규 VOD 를 수집하고 `--rm` 으로 종료한다.
 - 증분 수집이라 신규 0건이면 page 1만 보고 끝나 부하 거의 없음.
 - 치지직 조회를 위해 **컨테이너에 인터넷 접속 필요**.
 
-> 스케줄 근거: LCK 경기는 수~일 17~24시에 몰리고 월/화는 휴방(README 참조).
+> 서버 시간대는 UTC다. `deploy/crontab`은 UTC 시각으로 위 KST 시간을 환산했다.
 
 ---
 
@@ -76,11 +78,31 @@ crontab -l                 # 확인
 
 | 변수 | 기본값 | 설명 |
 |------|--------|------|
-| `MODE` | `bot` | `bot`=봇 상시 / `fetch`=수집 1회 후 종료 |
+| `MODE` | `bot` | `bot`=봇 상시 / `fetch`=VOD 수집 / `schedule`=Worlds 일정 동기화 |
 | `LCK_DB_PATH` | `/data/videos.sqlite` | DB 경로(볼륨). 봇·수집 스크립트가 이 변수를 읽음 |
 | `TELEGRAM_BOT_TOKEN` | — | BotFather 토큰. `--env-file` 로 주입 |
 | `CHZZK_CHANNEL_LCK` | `9381e7d6816e6d915a44a13c0195b202` | LCK 공식 채널 |
 | `CHZZK_CHANNEL_EWC` | `fce7c8735e0646e642007198a8875882` | EWC 공식 채널(RTE) |
+| `LCK_SCHEDULE_SEASON` | `2026` | Worlds 일정 대상 연도 |
+| `LCK_SCHEDULE_FROM_DATE` | `2026-10-24` | 초기 도입 동기화 시작일(KST) |
+
+### Worlds 일정 canary와 자동화
+
+DB를 SQLite backup API로 백업하고 복제본에서 드라이런·재실행 멱등성을 검증한 뒤 적용한다.
+Worlds Leaguepedia CSV는 미확보 상태이며, 실제 전환 검증은 `schedule/README.md`에 기록한다.
+
+```bash
+docker run --rm --network host --security-opt apparmor=unconfined \
+  -e MODE=schedule -e LCK_DB_PATH=/data/videos.sqlite \
+  -v /opt/lck-nospo:/data lck-nospo
+```
+
+두 번 연속 실행해 두 번째 결과가 `신규 0 / 변경 없음 N / 충돌 0`인지 확인한다.
+자동 실행은 기존 `MODE=fetch` 파이프라인에 포함되어 별도 cron을 등록하지 않는다.
+실행 이력은 `schedule_sync_runs`, 기존 배치 로그는 `/var/log/lck-nospo-fetch.log`에서 확인한다.
+일정 실패는 실행 이력에 남고 VOD 단계는 계속 실행된다.
+설치 전 `date -Iseconds`로 UTC 서버인지 확인하고 기존 crontab을 백업한다. 다른 작업이 있는
+서버에서는 전체 crontab 덮어쓰기 대신 프로젝트 라인만 갱신한다.
 
 ## 로그 / 중지
 

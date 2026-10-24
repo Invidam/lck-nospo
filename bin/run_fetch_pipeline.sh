@@ -17,6 +17,10 @@ cd "$REPO"
 
 {
   echo "=== $(date '+%Y-%m-%d %H:%M:%S %Z') fetch pipeline start ==="
+  "$PY" schedule/scripts/sync_ical_schedule.py \
+    --season "${LCK_SCHEDULE_SEASON:-2026}" \
+    --from-date "${LCK_SCHEDULE_FROM_DATE:-2026-10-24}" --apply \
+    || echo "일정 동기화 실패: schedule_sync_runs 확인 (계속)"
   for ch in "${CHANNELS[@]}"; do
     "$PY" vod_index/scripts/fetch_chzzk_vods.py "$ch" || echo "fetch failed: $ch"
   done

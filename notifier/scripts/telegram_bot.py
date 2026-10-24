@@ -47,6 +47,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 DB_PATH = Path(os.environ["LCK_DB_PATH"]) if os.environ.get("LCK_DB_PATH") else ROOT / "data" / "vods" / "videos.sqlite"
 TOTAL_SETS = 5
 KST = timezone(timedelta(hours=9))
+LCK_TEAMS = ("BFX", "BRO", "DK", "DNS", "GEN", "HLE", "KRX", "KT", "NS", "T1")
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
@@ -500,24 +501,14 @@ async def _render_sub_panel(msg_or_query, conn, chat_id, team, *, edit):
 
 
 def build_team_picker_keyboard(conn: sqlite3.Connection, command: str) -> ReplyKeyboardMarkup:
-    """matches에 등장한 팀들을 2열 그리드로. 누르면 '<command> <팀>' 전송."""
-    teams = [
-        row[0] for row in conn.execute(
-            """
-            SELECT DISTINCT team FROM (
-              SELECT team_a AS team FROM matches
-              UNION SELECT team_b FROM matches
-            ) ORDER BY team
-            """
-        ).fetchall()
-    ]
-    return _teams_to_picker(teams, command)
+    """LCK 10팀을 2열 그리드로 표시한다."""
+    return _teams_to_picker(list(LCK_TEAMS), command)
 
 
 def build_unsubscribe_picker_keyboard(
     conn: sqlite3.Connection, chat_id: int
 ) -> ReplyKeyboardMarkup | None:
-    subs = list_subscriptions(conn, chat_id)
+    subs = [sub for sub in list_subscriptions(conn, chat_id) if sub[0] in LCK_TEAMS]
     if not subs:
         return None
     return _teams_to_picker([team for team, *_ in subs], "/unsubscribe")
@@ -982,7 +973,7 @@ def schedule_pre_notifications(app: "Application") -> int:
     """앞으로 PRE_NOTIFY_SCAN_DAYS 일치 매치의 시작 알림을 run_once 로 예약.
 
     - 이미 지난(발송 시각이 과거인) 매치는 스킵.
-    - 같은 매치가 이미 예약돼 있으면(job name 중복) 스킵 → 재스캔 안전.
+    - 같은 매치의 일정이 바뀌면 기존 예약을 교체한다.
     반환: 이번에 새로 예약한 건수.
     """
     jq = app.job_queue
@@ -993,11 +984,14 @@ def schedule_pre_notifications(app: "Application") -> int:
     scheduled = 0
     for match in find_pre_notify_matches(conn, PRE_NOTIFY_SCAN_DAYS):
         fire_at = _parse_start(match["start_at_kst"]) - timedelta(minutes=PRE_NOTIFY_MINUTES)
+        job_name = f"pre:{match['match_id']}"
+        existing_jobs = jq.get_jobs_by_name(job_name)
+        if existing_jobs and all(job.data == match for job in existing_jobs):
+            continue
+        for job in existing_jobs:
+            job.schedule_removal()
         if fire_at <= now:
             continue
-        job_name = f"pre:{match['match_id']}"
-        if jq.get_jobs_by_name(job_name):
-            continue  # 이미 예약됨
         jq.run_once(pre_notify_worker, when=fire_at, data=match, name=job_name)
         scheduled += 1
     if scheduled:
@@ -1006,7 +1000,7 @@ def schedule_pre_notifications(app: "Application") -> int:
 
 
 async def pre_notify_rescan(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """하루 1회 재스캔 잡 — 신규 구독/일정 반영 & 재시작 복구."""
+    """5분 주기 재스캔 — 신규 구독/일정 반영 및 재시작 복구."""
     schedule_pre_notifications(ctx.application)
 
 
@@ -1169,12 +1163,12 @@ def main() -> int:
             NOTIFY_INTERVAL_SEC, NOTIFY_DELAY_HOURS,
         )
         # 경기 시작 알림: 재스캔 잡이 봇 시작 직후(first=10s) 최초 예약을 하고,
-        # 이후 24h마다 재스캔해 신규 구독/일정 반영 & 재시작 복구.
+        # 이후 5분마다 재스캔해 신규 구독/일정 반영 & 재시작 복구.
         app.job_queue.run_repeating(
-            pre_notify_rescan, interval=timedelta(days=1), first=10
+            pre_notify_rescan, interval=300, first=10
         )
         log.info(
-            "시작 알림 재스캔 등록: 24h 주기, 시작 %d분 전 예약 (앞으로 %d일)",
+            "시작 알림 재스캔 등록: 5분 주기, 시작 %d분 전 예약 (앞으로 %d일)",
             PRE_NOTIFY_MINUTES, PRE_NOTIFY_SCAN_DAYS,
         )
 
